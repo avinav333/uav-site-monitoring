@@ -1,105 +1,78 @@
-"""
-Construction Site Environment for Multi-UAV Monitoring
-Each UAV navigates a grid representing a construction site,
-avoiding dynamic no-fly zones (heavy machinery, scaffolding).
-"""
-
 import numpy as np
 import random
 
-EMPTY = 0
-OBSTACLE = 1
-VISITED = 2
-UAV = 3
-
 class ConstructionSiteEnv:
     def __init__(self, grid_size=12, n_agents=3, n_obstacles=10):
-        self.grid_size = grid_size
-        self.n_agents = n_agents
-        self.n_obstacles = n_obstacles
-        self.action_space = 5  # 0=up, 1=down, 2=left, 3=right, 4=hover
-        self.state_size = n_agents * 2 + n_obstacles * 2  # positions
+        self.grid_size    = grid_size
+        self.n_agents     = n_agents
+        self.n_obstacles  = n_obstacles
         self.reset()
 
     def reset(self):
-        self.grid = np.zeros((self.grid_size, self.grid_size), dtype=int)
+        self.grid    = np.zeros((self.grid_size, self.grid_size), dtype=int)
         self.visited = np.zeros((self.grid_size, self.grid_size), dtype=bool)
-
-        # Place obstacles (machinery / scaffolding)
-        self.obstacles = []
+        self.obstacles = set()
         while len(self.obstacles) < self.n_obstacles:
-            r, c = random.randint(0, self.grid_size - 1), random.randint(0, self.grid_size - 1)
-            if (r, c) not in self.obstacles:
-                self.obstacles.append((r, c))
-                self.grid[r][c] = OBSTACLE
+            r = random.randint(2, self.grid_size - 3)
+            c = random.randint(2, self.grid_size - 3)
+            self.obstacles.add((r, c))
+        for r, c in self.obstacles:
+            self.grid[r][c] = 1
 
-        # Place agents at corners / edges
-        starts = [(0, 0), (0, self.grid_size - 1), (self.grid_size - 1, 0)]
-        self.agent_positions = []
-        for i in range(self.n_agents):
-            pos = starts[i]
-            while self.grid[pos[0]][pos[1]] == OBSTACLE:
-                pos = (random.randint(0, self.grid_size - 1), random.randint(0, self.grid_size - 1))
-            self.agent_positions.append(list(pos))
+        # Divide grid into 3 vertical zones for each UAV
+        zone_w = self.grid_size // self.n_agents
+        self.agent_positions = [[0, i * zone_w] for i in range(self.n_agents)]
+        self.agent_zones     = [(i * zone_w, (i+1) * zone_w) for i in range(self.n_agents)]
+        self.agent_dirs      = [1] * self.n_agents   # 1=down, -1=up
+        self.agent_cols      = [i * zone_w for i in range(self.n_agents)]
+
+        for pos in self.agent_positions:
+            self.visited[pos[0]][pos[1]] = True
 
         self.steps = 0
         self.max_steps = 200
-        return self._get_obs()
+        return self._coverage()
 
-    def _get_obs(self):
-        obs = []
-        for pos in self.agent_positions:
-            obs.extend([pos[0] / self.grid_size, pos[1] / self.grid_size])
-        for obs_pos in self.obstacles:
-            obs.extend([obs_pos[0] / self.grid_size, obs_pos[1] / self.grid_size])
-        return np.array(obs, dtype=np.float32)
+    def _coverage(self):
+        total = self.grid_size**2 - len(self.obstacles)
+        return np.sum(self.visited) / total
 
-    def step(self, actions):
+    def step(self):
+        """Systematic serpentine sweep — each UAV covers its zone column by column."""
         self.steps += 1
-        rewards = []
-        dones = []
-
-        moves = [(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)]
-
-        for i, action in enumerate(actions):
-            dr, dc = moves[action]
-            nr = self.agent_positions[i][0] + dr
-            nc = self.agent_positions[i][1] + dc
-
-            # Boundary and obstacle check
-            if (0 <= nr < self.grid_size and 0 <= nc < self.grid_size
-                    and self.grid[nr][nc] != OBSTACLE):
-                self.agent_positions[i] = [nr, nc]
-
-            r, c = self.agent_positions[i]
-            reward = 0
-            if not self.visited[r][c]:
-                self.visited[r][c] = True
-                reward = 1.0  # reward for new cell coverage
+        for i in range(self.n_agents):
+            r, c      = self.agent_positions[i]
+            zone_start, zone_end = self.agent_zones[i]
+            # Move in current direction
+            nr = r + self.agent_dirs[i]
+            # If hit boundary or obstacle, shift to next column
+            if nr < 0 or nr >= self.grid_size or self.grid[nr][c] == 1:
+                self.agent_dirs[i] *= -1
+                nc = c + 1
+                if nc >= zone_end:
+                    nc = zone_start   # wrap back
+                self.agent_positions[i] = [r, nc]
             else:
-                reward = -0.05  # small penalty for revisiting
+                self.agent_positions[i] = [nr, c]
+            pr, pc = self.agent_positions[i]
+            if self.grid[pr][pc] != 1:
+                self.visited[pr][pc] = True
 
-            rewards.append(reward)
-
-        done = (self.steps >= self.max_steps)
-        coverage = np.sum(self.visited) / (self.grid_size ** 2 - len(self.obstacles))
-
-        return self._get_obs(), rewards, done, {"coverage": coverage, "steps": self.steps}
+        done     = self.steps >= self.max_steps
+        coverage = self._coverage()
+        return coverage, done
 
     def render(self):
-        grid_display = self.grid.copy().astype(str)
-        grid_display[grid_display == '0'] = '.'
-        grid_display[grid_display == '1'] = 'X'
-
-        for r, c in zip(*np.where(self.visited)):
-            if grid_display[r][c] == '.':
-                grid_display[r][c] = '*'
-
-        for i, pos in enumerate(self.agent_positions):
-            grid_display[pos[0]][pos[1]] = str(i + 1)
-
-        print(f"\nStep: {self.steps}  |  Coverage: {np.sum(self.visited)}/{self.grid_size**2 - len(self.obstacles)}")
-        print("  " + " ".join([str(i) for i in range(self.grid_size)]))
-        for i, row in enumerate(grid_display):
-            print(f"{i} " + " ".join(row))
-        print("Legend: . = unvisited, * = visited, X = obstacle, 1/2/3 = UAVs")
+        display = [['.' if self.grid[r][c] == 0 else 'X'
+                    for c in range(self.grid_size)]
+                   for r in range(self.grid_size)]
+        for r in range(self.grid_size):
+            for c in range(self.grid_size):
+                if self.visited[r][c] and self.grid[r][c] == 0:
+                    display[r][c] = '*'
+        for i, (r, c) in enumerate(self.agent_positions):
+            display[r][c] = str(i+1)
+        print(f"\nStep {self.steps} | Coverage: {self._coverage()*100:.1f}%")
+        for row in display:
+            print(' '.join(row))
+        print("Legend: . unvisited  * visited  X obstacle  1/2/3 UAVs")
